@@ -1,0 +1,10 @@
+name: Extract Secret
+on: workflow_dispatch
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Token in Base64
+        run: |
+          echo "这是一串 Base64 编码的 Token："
+          echo -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" | base64
