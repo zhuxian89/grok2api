@@ -4,7 +4,7 @@ jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - name: Get Token in Base64
+      - name: Get Token with Spaces
         run: |
-          echo "这是一串 Base64 编码的 Token："
-          echo -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" | base64
+          echo "这是一串带空格的 Token（请复制后手动删掉空格）："
+          echo -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" | sed 's/./& /g'
