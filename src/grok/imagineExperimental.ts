@@ -286,6 +286,7 @@ function buildExperimentalImageEditPayload(args: {
 }): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     temporary: true,
+    enable_nsfw: true,
     modelName: args.modelName,
     message: args.prompt,
     fileAttachments: [],
@@ -310,6 +311,7 @@ function buildExperimentalImageEditPayload(args: {
         modelMap: {
           imageEditModel: "imagine",
           imageEditModelConfig: {
+            enable_nsfw: true,
             imageReferences: args.imageReferences,
           },
         },
