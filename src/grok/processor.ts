@@ -245,6 +245,8 @@ export function createOpenAiStreamFromGrokNdjson(
             controller.enqueue(encoder.encode(makeDone()));
             return;
           }
+          // No tool calls found — flush buffered text as normal content
+          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, toolBuffer)));
         }
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
