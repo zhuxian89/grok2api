@@ -1,4 +1,5 @@
 import type { GrokSettings, GlobalSettings } from "../settings";
+import { parseToolCalls, type ToolDefinition, type ToolCall } from "./toolCall";
 
 type GrokNdjson = Record<string, unknown>;
 
@@ -22,7 +23,7 @@ function makeChunk(
   created: number,
   model: string,
   content: string,
-  finish_reason?: "stop" | "error" | null,
+  finish_reason?: "stop" | "tool_calls" | "error" | null,
 ): string {
   const payload: Record<string, unknown> = {
     id,
@@ -42,6 +43,63 @@ function makeChunk(
 
 function makeDone(): string {
   return "data: [DONE]\n\n";
+}
+
+function makeToolCallChunk(
+  id: string,
+  created: number,
+  model: string,
+  toolCalls: ToolCall[],
+  textContent: string | null,
+  finish_reason: "tool_calls" | "stop",
+): string[] {
+  const chunks: string[] = [];
+
+  // If there's text content alongside tool calls, emit it first
+  if (textContent) {
+    chunks.push(makeChunk(id, created, model, textContent));
+  }
+
+  // Emit tool call deltas
+  const deltas: Array<Record<string, unknown>> = toolCalls.map((tc, idx) => ({
+    index: idx,
+    id: tc.id,
+    type: "function",
+    function: { name: tc.function.name, arguments: tc.function.arguments },
+  }));
+
+  const payload: Record<string, unknown> = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { role: "assistant", tool_calls: deltas },
+        finish_reason: null,
+      },
+    ],
+  };
+  chunks.push(`data: ${JSON.stringify(payload)}\n\n`);
+
+  // Emit finish with tool_calls reason
+  const finishPayload: Record<string, unknown> = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {},
+        finish_reason,
+      },
+    ],
+  };
+  chunks.push(`data: ${JSON.stringify(finishPayload)}\n\n`);
+
+  return chunks;
 }
 
 function toImgProxyUrl(globalCfg: GlobalSettings, origin: string, path: string): string {
@@ -122,6 +180,8 @@ export function createOpenAiStreamFromGrokNdjson(
     global: GlobalSettings;
     origin: string;
     requestedModel: string;
+    tools?: ToolDefinition[] | undefined;
+    toolChoice?: unknown;
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
 ): ReadableStream<Uint8Array> {
@@ -170,8 +230,22 @@ export function createOpenAiStreamFromGrokNdjson(
       let lastVideoProgress = -1;
 
       let buffer = "";
+      const hasTools = Boolean(opts.tools?.length);
+      let toolBuffer = "";
 
       const flushStop = () => {
+        // When tools are present, check if buffered content contains tool calls
+        if (hasTools && toolBuffer) {
+          const { text: textContent, toolCalls } = parseToolCalls(toolBuffer, opts.tools);
+          if (toolCalls && toolCalls.length) {
+            const chunks = makeToolCallChunk(id, created, currentModel, toolCalls, textContent, "tool_calls");
+            for (const chunk of chunks) {
+              controller.enqueue(encoder.encode(chunk));
+            }
+            controller.enqueue(encoder.encode(makeDone()));
+            return;
+          }
+        }
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
       };
@@ -377,7 +451,13 @@ export function createOpenAiStreamFromGrokNdjson(
               shouldSkip = true;
             }
 
-            if (!shouldSkip) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+            if (!shouldSkip) {
+              if (hasTools) {
+                toolBuffer += content;
+              } else {
+                controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+              }
+            }
             isThinking = currentIsThinking;
           }
         }
@@ -409,7 +489,15 @@ export function createOpenAiStreamFromGrokNdjson(
 
 export async function parseOpenAiFromGrokNdjson(
   grokResp: Response,
-  opts: { cookie: string; settings: GrokSettings; global: GlobalSettings; origin: string; requestedModel: string },
+  opts: {
+    cookie: string;
+    settings: GrokSettings;
+    global: GlobalSettings;
+    origin: string;
+    requestedModel: string;
+    tools?: ToolDefinition[] | undefined;
+    toolChoice?: unknown;
+  },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
   const text = await grokResp.text();
@@ -474,6 +562,30 @@ export async function parseOpenAiFromGrokNdjson(
 
     // For normal chat replies, the first modelResponse is enough.
     break;
+  }
+
+  // Check for tool calls in the response
+  if (opts.tools?.length && content) {
+    const { text: textContent, toolCalls } = parseToolCalls(content, opts.tools);
+    if (toolCalls && toolCalls.length) {
+      const message: Record<string, unknown> = { role: "assistant", tool_calls: toolCalls };
+      if (textContent) message.content = textContent;
+      else message.content = null;
+      return {
+        id: `chatcmpl-${crypto.randomUUID()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [
+          {
+            index: 0,
+            message,
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: null,
+      };
+    }
   }
 
   return {

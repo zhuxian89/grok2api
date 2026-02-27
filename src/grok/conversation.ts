@@ -1,16 +1,23 @@
 import type { GrokSettings } from "../settings";
 import { getDynamicHeaders } from "./headers";
 import { getModelInfo, toGrokModel } from "./models";
+import { buildToolPrompt, formatToolHistory, type ToolDefinition, type OpenAIMessage } from "./toolCall";
 
 export interface OpenAIChatMessage {
   role: string;
   content: string | Array<{ type: string; text?: string; image_url?: { url?: string } }>;
+  tool_calls?: Array<{ function?: { name?: string; arguments?: string } }>;
+  tool_call_id?: string;
+  name?: string;
 }
 
 export interface OpenAIChatRequestBody {
   model: string;
   messages: OpenAIChatMessage[];
   stream?: boolean;
+  tools?: ToolDefinition[];
+  tool_choice?: unknown;
+  parallel_tool_calls?: boolean;
   video_config?: {
     aspect_ratio?: string;
     video_length?: number;
@@ -21,11 +28,20 @@ export interface OpenAIChatRequestBody {
 
 export const CONVERSATION_API = "https://grok.com/rest/app-chat/conversations/new";
 
-export function extractContent(messages: OpenAIChatMessage[]): { content: string; images: string[] } {
+export function extractContent(
+  messages: OpenAIChatMessage[],
+  opts?: { tools?: ToolDefinition[] | undefined; toolChoice?: unknown; parallelToolCalls?: boolean | undefined },
+): { content: string; images: string[] } {
   const images: string[] = [];
   const extracted: Array<{ role: string; text: string }> = [];
 
-  for (const msg of messages) {
+  // Pre-process: convert tool-related messages to text format
+  let processedMessages: OpenAIChatMessage[] = messages;
+  if (opts?.tools && opts.tools.length) {
+    processedMessages = formatToolHistory(messages as OpenAIMessage[]) as OpenAIChatMessage[];
+  }
+
+  for (const msg of processedMessages) {
     const role = msg.role ?? "user";
     const content = msg.content ?? "";
 
@@ -65,7 +81,17 @@ export function extractContent(messages: OpenAIChatMessage[]): { content: string
     else out.push(`${role}: ${text}`);
   }
 
-  return { content: out.join("\n\n"), images };
+  let finalContent = out.join("\n\n");
+
+  // Prepend tool system prompt if tools are provided
+  if (opts?.tools && opts.tools.length) {
+    const toolPrompt = buildToolPrompt(opts.tools, opts.toolChoice, opts.parallelToolCalls ?? true);
+    if (toolPrompt) {
+      finalContent = `${toolPrompt}\n\n${finalContent}`;
+    }
+  }
+
+  return { content: finalContent, images };
 }
 
 export function buildConversationPayload(args: {

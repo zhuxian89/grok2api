@@ -1199,6 +1199,9 @@ openAiRoutes.post("/chat/completions", async (c) => {
       model?: string;
       messages?: any[];
       stream?: boolean;
+      tools?: any[];
+      tool_choice?: unknown;
+      parallel_tool_calls?: boolean;
       video_config?: {
         aspect_ratio?: string;
         video_length?: number;
@@ -1247,7 +1250,11 @@ openAiRoutes.post("/chat/completions", async (c) => {
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
-      const { content, images } = extractContent(body.messages as any);
+      const { content, images } = extractContent(body.messages as any, {
+        tools: body.tools,
+        toolChoice: body.tool_choice,
+        parallelToolCalls: body.parallel_tool_calls,
+      });
       const isVideoModel = Boolean(cfg.is_video_model);
       const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
 
@@ -1304,6 +1311,8 @@ openAiRoutes.post("/chat/completions", async (c) => {
             global: settingsBundle.global,
             origin,
             requestedModel,
+            tools: body.tools,
+            toolChoice: body.tool_choice,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
@@ -1335,6 +1344,8 @@ openAiRoutes.post("/chat/completions", async (c) => {
           global: settingsBundle.global,
           origin,
           requestedModel,
+          tools: body.tools,
+          toolChoice: body.tool_choice,
         });
 
         const duration = (Date.now() - start) / 1000;
