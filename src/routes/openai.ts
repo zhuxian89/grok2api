@@ -1250,7 +1250,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
-      const { content, images } = extractContent(body.messages as any, {
+      const { content, images, delimiter } = extractContent(body.messages as any, {
         tools: body.tools,
         toolChoice: body.tool_choice,
         parallelToolCalls: body.parallel_tool_calls,
@@ -1313,6 +1313,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             requestedModel,
             tools: body.tools,
             toolChoice: body.tool_choice,
+            delimiter,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
@@ -1346,6 +1347,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
           requestedModel,
           tools: body.tools,
           toolChoice: body.tool_choice,
+          delimiter,
         });
 
         const duration = (Date.now() - start) / 1000;

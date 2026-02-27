@@ -1,7 +1,7 @@
 import type { GrokSettings } from "../settings";
 import { getDynamicHeaders } from "./headers";
 import { getModelInfo, toGrokModel } from "./models";
-import { buildToolPrompt, formatToolHistory, type ToolDefinition, type OpenAIMessage } from "./toolCall";
+import { buildToolPrompt, formatToolHistory, type ToolDefinition, type OpenAIMessage, type DelimiterMarkers } from "./toolCall";
 
 export interface OpenAIChatMessage {
   role: string;
@@ -31,14 +31,20 @@ export const CONVERSATION_API = "https://grok.com/rest/app-chat/conversations/ne
 export function extractContent(
   messages: OpenAIChatMessage[],
   opts?: { tools?: ToolDefinition[] | undefined; toolChoice?: unknown; parallelToolCalls?: boolean | undefined },
-): { content: string; images: string[] } {
+): { content: string; images: string[]; delimiter: DelimiterMarkers | null } {
   const images: string[] = [];
   const extracted: Array<{ role: string; text: string }> = [];
+  let delimiter: DelimiterMarkers | null = null;
+  let toolSystemPrompt = "";
 
   // Pre-process: convert tool-related messages to text format
   let processedMessages: OpenAIChatMessage[] = messages;
   if (opts?.tools && opts.tools.length) {
-    processedMessages = formatToolHistory(messages as OpenAIMessage[]) as OpenAIChatMessage[];
+    // Build prompt first to get delimiter, then use it for history formatting
+    const result = buildToolPrompt(opts.tools, opts.toolChoice, opts.parallelToolCalls ?? true);
+    delimiter = result.delimiter;
+    toolSystemPrompt = result.prompt;
+    processedMessages = formatToolHistory(messages as OpenAIMessage[], delimiter ?? undefined) as OpenAIChatMessage[];
   }
 
   for (const msg of processedMessages) {
@@ -84,14 +90,11 @@ export function extractContent(
   let finalContent = out.join("\n\n");
 
   // Prepend tool system prompt if tools are provided
-  if (opts?.tools && opts.tools.length) {
-    const toolPrompt = buildToolPrompt(opts.tools, opts.toolChoice, opts.parallelToolCalls ?? true);
-    if (toolPrompt) {
-      finalContent = `${toolPrompt}\n\n${finalContent}`;
-    }
+  if (toolSystemPrompt) {
+    finalContent = `${toolSystemPrompt}\n\n${finalContent}`;
   }
 
-  return { content: finalContent, images };
+  return { content: finalContent, images, delimiter };
 }
 
 export function buildConversationPayload(args: {

@@ -1,5 +1,5 @@
 import type { GrokSettings, GlobalSettings } from "../settings";
-import { parseToolCalls, type ToolDefinition, type ToolCall } from "./toolCall";
+import { parseToolCalls, ToolifyParser, type ToolDefinition, type ToolCall, type DelimiterMarkers } from "./toolCall";
 
 type GrokNdjson = Record<string, unknown>;
 
@@ -182,6 +182,7 @@ export function createOpenAiStreamFromGrokNdjson(
     requestedModel: string;
     tools?: ToolDefinition[] | undefined;
     toolChoice?: unknown;
+    delimiter?: DelimiterMarkers | null | undefined;
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
 ): ReadableStream<Uint8Array> {
@@ -231,12 +232,53 @@ export function createOpenAiStreamFromGrokNdjson(
 
       let buffer = "";
       const hasTools = Boolean(opts.tools?.length);
+      const toolParser = hasTools && opts.delimiter ? new ToolifyParser(opts.delimiter) : null;
       let toolBuffer = "";
 
+      const drainParserEvents = () => {
+        if (!toolParser) return;
+        for (const ev of toolParser.consumeEvents()) {
+          if (ev.type === "text" && ev.content) {
+            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, ev.content)));
+          } else if (ev.type === "tool_call" && ev.call) {
+            // Validate against known tool names
+            const validNames = new Set<string>();
+            if (opts.tools?.length) {
+              for (const t of opts.tools) {
+                const n = t.function?.name;
+                if (n) validNames.add(n);
+              }
+            }
+            if (validNames.size && !validNames.has(ev.call.name)) {
+              // Unknown tool — emit as text
+              continue;
+            }
+            const argsStr = typeof ev.call.arguments === "string"
+              ? ev.call.arguments
+              : JSON.stringify(ev.call.arguments);
+            const tc: ToolCall = {
+              id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+              type: "function",
+              function: { name: ev.call.name, arguments: argsStr },
+            };
+            const chunks = makeToolCallChunk(id, created, currentModel, [tc], null, "tool_calls");
+            for (const chunk of chunks) {
+              controller.enqueue(encoder.encode(chunk));
+            }
+          } else if (ev.type === "tool_call_failed" && ev.content) {
+            // Emit failed tool call content as text
+            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, ev.content)));
+          }
+        }
+      };
+
       const flushStop = () => {
-        // When tools are present, check if buffered content contains tool calls
-        if (hasTools && toolBuffer) {
-          const { text: textContent, toolCalls } = parseToolCalls(toolBuffer, opts.tools);
+        if (toolParser) {
+          toolParser.finish();
+          drainParserEvents();
+        } else if (hasTools && toolBuffer) {
+          // Fallback: no delimiter available, use batch parsing
+          const { text: textContent, toolCalls } = parseToolCalls(toolBuffer, opts.delimiter!, opts.tools);
           if (toolCalls && toolCalls.length) {
             const chunks = makeToolCallChunk(id, created, currentModel, toolCalls, textContent, "tool_calls");
             for (const chunk of chunks) {
@@ -454,7 +496,10 @@ export function createOpenAiStreamFromGrokNdjson(
             }
 
             if (!shouldSkip) {
-              if (hasTools) {
+              if (toolParser) {
+                toolParser.feed(content);
+                drainParserEvents();
+              } else if (hasTools) {
                 toolBuffer += content;
               } else {
                 controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
@@ -464,8 +509,7 @@ export function createOpenAiStreamFromGrokNdjson(
           }
         }
 
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
-        controller.enqueue(encoder.encode(makeDone()));
+        flushStop();
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
         controller.close();
       } catch (e) {
@@ -499,6 +543,7 @@ export async function parseOpenAiFromGrokNdjson(
     requestedModel: string;
     tools?: ToolDefinition[] | undefined;
     toolChoice?: unknown;
+    delimiter?: DelimiterMarkers | null | undefined;
   },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
@@ -567,8 +612,8 @@ export async function parseOpenAiFromGrokNdjson(
   }
 
   // Check for tool calls in the response
-  if (opts.tools?.length && content) {
-    const { text: textContent, toolCalls } = parseToolCalls(content, opts.tools);
+  if (opts.tools?.length && opts.delimiter && content) {
+    const { text: textContent, toolCalls } = parseToolCalls(content, opts.delimiter, opts.tools);
     if (toolCalls && toolCalls.length) {
       const message: Record<string, unknown> = { role: "assistant", tool_calls: toolCalls };
       if (textContent) message.content = textContent;
