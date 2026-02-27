@@ -11,6 +11,7 @@ from typing import Any, AsyncGenerator, Optional, AsyncIterable, List
 from app.core.config import get_config
 from app.core.logger import logger
 from app.services.grok.assets import DownloadService
+from app.services.grok.tool_call import parse_tool_calls, parse_tool_call_block
 
 
 ASSET_URL = "https://assets.grok.com/"
@@ -82,7 +83,7 @@ class BaseProcessor:
             return f"{self.app_url.rstrip('/')}{local_path}"
         return local_path
             
-    def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
+    def _sse(self, content: str = "", role: str = None, finish: str = None, tool_calls: list = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
         if not hasattr(self, 'response_id'):
             self.response_id = None
@@ -93,6 +94,8 @@ class BaseProcessor:
         if role:
             delta["role"] = role
             delta["content"] = ""
+        elif tool_calls is not None:
+            delta["tool_calls"] = tool_calls
         elif content:
             delta["content"] = content
         
@@ -110,7 +113,8 @@ class BaseProcessor:
 class StreamProcessor(BaseProcessor):
     """流式响应处理器"""
     
-    def __init__(self, model: str, token: str = "", think: bool = None):
+    def __init__(self, model: str, token: str = "", think: bool = None,
+                 tools: list = None, tool_choice: Any = None):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
         self.fingerprint: str = ""
@@ -118,12 +122,101 @@ class StreamProcessor(BaseProcessor):
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
-        
+
         if think is None:
             self.show_think = get_config("grok.thinking", False)
         else:
             self.show_think = think
-    
+
+        # Tool calling state
+        self.tools = tools or []
+        self.tool_choice = tool_choice
+        self._tool_stream_enabled = bool(self.tools) and self.tool_choice != "none"
+        self._tool_state: str = "text"
+        self._tool_buffer: str = ""
+        self._tool_partial: str = ""
+        self._tool_calls_seen: bool = False
+
+    def _suffix_prefix(self, text: str, tag: str) -> int:
+        """Check if end of text is a prefix of tag."""
+        if not text or not tag:
+            return 0
+        max_keep = min(len(text), len(tag) - 1)
+        for keep in range(max_keep, 0, -1):
+            if text.endswith(tag[:keep]):
+                return keep
+        return 0
+
+    def _handle_tool_stream(self, chunk: str) -> list:
+        """Parse tool_call tags from streaming tokens."""
+        events = []
+        if not chunk:
+            return events
+
+        start_tag = "<tool_call>"
+        end_tag = "</tool_call>"
+        data = f"{self._tool_partial}{chunk}"
+        self._tool_partial = ""
+
+        while data:
+            if self._tool_state == "text":
+                start_idx = data.find(start_tag)
+                if start_idx == -1:
+                    keep = self._suffix_prefix(data, start_tag)
+                    emit = data[:-keep] if keep else data
+                    if emit:
+                        events.append(("text", emit))
+                    self._tool_partial = data[-keep:] if keep else ""
+                    break
+
+                before = data[:start_idx]
+                if before:
+                    events.append(("text", before))
+                data = data[start_idx + len(start_tag):]
+                self._tool_state = "tool"
+                continue
+
+            end_idx = data.find(end_tag)
+            if end_idx == -1:
+                keep = self._suffix_prefix(data, end_tag)
+                append = data[:-keep] if keep else data
+                if append:
+                    self._tool_buffer += append
+                self._tool_partial = data[-keep:] if keep else ""
+                break
+
+            self._tool_buffer += data[:end_idx]
+            data = data[end_idx + len(end_tag):]
+            tool_call = parse_tool_call_block(self._tool_buffer, self.tools)
+            if tool_call:
+                events.append(("tool", tool_call))
+                self._tool_calls_seen = True
+            self._tool_buffer = ""
+            self._tool_state = "text"
+
+        return events
+
+    def _flush_tool_stream(self) -> list:
+        """Flush remaining tool stream buffer."""
+        events = []
+        if self._tool_state == "text":
+            if self._tool_partial:
+                events.append(("text", self._tool_partial))
+                self._tool_partial = ""
+            return events
+
+        raw = f"{self._tool_buffer}{self._tool_partial}"
+        tool_call = parse_tool_call_block(raw, self.tools)
+        if tool_call:
+            events.append(("tool", tool_call))
+            self._tool_calls_seen = True
+        elif raw:
+            events.append(("text", f"<tool_call>{raw}"))
+        self._tool_buffer = ""
+        self._tool_partial = ""
+        self._tool_state = "text"
+        return events
+
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
         try:
@@ -191,11 +284,29 @@ class StreamProcessor(BaseProcessor):
                 # 普通 token
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
-                        yield self._sse(token)
+                        if self._tool_stream_enabled:
+                            for kind, payload in self._handle_tool_stream(token):
+                                if kind == "text":
+                                    yield self._sse(payload)
+                                elif kind == "tool":
+                                    yield self._sse(tool_calls=[payload])
+                        else:
+                            yield self._sse(token)
                         
             if self.think_opened:
                 yield self._sse("</think>\n")
-            yield self._sse(finish="stop")
+
+            if self._tool_stream_enabled:
+                for kind, payload in self._flush_tool_stream():
+                    if kind == "text":
+                        yield self._sse(payload)
+                    elif kind == "tool":
+                        yield self._sse(tool_calls=[payload])
+                finish_reason = "tool_calls" if self._tool_calls_seen else "stop"
+                yield self._sse(finish=finish_reason)
+            else:
+                yield self._sse(finish="stop")
+
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"Stream processing error: {e}", extra={"model": self.model})
@@ -206,10 +317,13 @@ class StreamProcessor(BaseProcessor):
 
 class CollectProcessor(BaseProcessor):
     """非流式响应处理器"""
-    
-    def __init__(self, model: str, token: str = ""):
+
+    def __init__(self, model: str, token: str = "",
+                 tools: list = None, tool_choice: Any = None):
         super().__init__(model, token)
         self.image_format = get_config("app.image_format", "url")
+        self.tools = tools or []
+        self.tool_choice = tool_choice
     
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集完整响应"""
@@ -261,6 +375,25 @@ class CollectProcessor(BaseProcessor):
         finally:
             await self.close()
         
+        # Parse for tool calls if tools were provided
+        finish_reason = "stop"
+        tool_calls_result = None
+        if self.tools and self.tool_choice != "none":
+            text_content, tool_calls_list = parse_tool_calls(content, self.tools)
+            if tool_calls_list:
+                tool_calls_result = tool_calls_list
+                content = text_content  # May be None
+                finish_reason = "tool_calls"
+
+        message_obj = {
+            "role": "assistant",
+            "content": content,
+            "refusal": None,
+            "annotations": [],
+        }
+        if tool_calls_result:
+            message_obj["tool_calls"] = tool_calls_result
+
         return {
             "id": response_id,
             "object": "chat.completion",
@@ -269,8 +402,8 @@ class CollectProcessor(BaseProcessor):
             "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content, "refusal": None, "annotations": []},
-                "finish_reason": "stop"
+                "message": message_obj,
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
@@ -357,6 +490,7 @@ class VideoStreamProcessor(BaseProcessor):
                         
             if self.think_opened:
                 yield self._sse("</think>\n")
+
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -455,7 +589,7 @@ class ImageStreamProcessor(BaseProcessor):
     def _sse(self, event: str, data: dict) -> str:
         """构建 SSE 响应 (覆盖基类)"""
         return f"event: {event}\ndata: {orjson.dumps(data).decode()}\n\n"
-    
+
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
         final_images = []

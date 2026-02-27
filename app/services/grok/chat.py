@@ -6,7 +6,7 @@ import asyncio
 import uuid
 import orjson
 from typing import Dict, List, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from curl_cffi.requests import AsyncSession
 
@@ -23,6 +23,7 @@ from app.services.grok.model import ModelService
 from app.services.grok.assets import UploadService
 from app.services.grok.processor import StreamProcessor, CollectProcessor
 from app.services.grok.retry import retry_on_status
+from app.services.grok.tool_call import build_tool_prompt, format_tool_history
 from app.services.token import get_token_manager
 from app.services.request_stats import request_stats
 
@@ -39,6 +40,9 @@ class ChatRequest:
     messages: List[Dict[str, Any]]
     stream: bool = None
     think: bool = None
+    tools: List[Dict[str, Any]] = field(default=None)
+    tool_choice: Any = None
+    parallel_tool_calls: bool = True
 
 
 class MessageExtractor:
@@ -50,20 +54,33 @@ class MessageExtractor:
     VIDEO_UNSUPPORTED = {"input_audio", "file"}
     
     @staticmethod
-    def extract(messages: List[Dict[str, Any]], is_video: bool = False) -> tuple[str, List[str]]:
+    def extract(
+        messages: List[Dict[str, Any]],
+        is_video: bool = False,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool = True,
+    ) -> tuple[str, List[str]]:
         """
         从 OpenAI 消息格式提取内容
-        
+
         Args:
             messages: OpenAI 格式消息列表
             is_video: 是否为视频模型
-            
+            tools: Tool definitions for function calling
+            tool_choice: Tool choice mode
+            parallel_tool_calls: Whether parallel tool calls are allowed
+
         Returns:
             (text, attachments): 拼接后的文本和需要上传的附件列表
-            
+
         Raises:
             ValueError: 视频模型遇到不支持的内容类型
         """
+        # Pre-process: convert tool-related messages to text format
+        if tools:
+            messages = format_tool_history(messages)
+
         texts = []
         attachments = []  # 需要上传的附件 (URL 或 base64)
 
@@ -139,6 +156,13 @@ class MessageExtractor:
 
         # 换行拼接文本
         message = "\n\n".join(texts)
+
+        # Prepend tool system prompt if tools are provided
+        if tools:
+            tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
+            if tool_prompt:
+                message = f"{tool_prompt}\n\n{message}"
+
         return message, attachments
     
     @staticmethod
@@ -401,7 +425,13 @@ class GrokChatService:
         
         # 提取消息和附件
         try:
-            message, attachments = MessageExtractor.extract(request.messages, is_video=is_video)
+            message, attachments = MessageExtractor.extract(
+                request.messages,
+                is_video=is_video,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+            )
         except ValueError as e:
             raise ValidationException(str(e))
         
@@ -449,7 +479,10 @@ class ChatService:
         model: str,
         messages: List[Dict[str, Any]],
         stream: bool = None,
-        thinking: str = None
+        thinking: str = None,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool = True,
     ):
         """
         Chat Completions 入口
@@ -506,7 +539,10 @@ class ChatService:
             model=model,
             messages=messages,
             stream=is_stream,
-            think=think
+            think=think,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls if parallel_tool_calls is not None else True,
         )
         
         # 请求 Grok
@@ -532,7 +568,10 @@ class ChatService:
         
         # 处理响应
         if is_stream:
-            processor = StreamProcessor(model_name, token, think).process(response)
+            processor = StreamProcessor(
+                model_name, token, think,
+                tools=tools, tool_choice=tool_choice,
+            ).process(response)
 
             async def _wrapped_stream():
                 completed = False
@@ -553,7 +592,10 @@ class ChatService:
 
             return _wrapped_stream()
 
-        result = await CollectProcessor(model_name, token).process(response)
+        result = await CollectProcessor(
+            model_name, token,
+            tools=tools, tool_choice=tool_choice,
+        ).process(response)
         try:
             await token_mgr.sync_usage(token, model_name, consume_on_fail=True, is_usage=True)
             await request_stats.record_request(model_name, success=True)
