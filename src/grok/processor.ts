@@ -231,43 +231,46 @@ export function createOpenAiStreamFromGrokNdjson(
       let lastVideoProgress = -1;
 
       let buffer = "";
-      const hasTools = Boolean(opts.tools?.length);
-      const toolParser = hasTools && opts.delimiter ? new ToolifyParser(opts.delimiter) : null;
-      let toolBuffer = "";
+      const hasToolDefs = Boolean(opts.tools?.length);
+      const toolParser = hasToolDefs && opts.delimiter ? new ToolifyParser(opts.delimiter) : null;
+      const validToolNames = new Set<string>();
+      if (hasToolDefs) {
+        for (const t of opts.tools!) {
+          const n = t.function?.name;
+          if (n) validToolNames.add(n);
+        }
+      }
+      const pendingToolCalls: ToolCall[] = [];
+      let sawToolCall = false;
 
       const drainParserEvents = () => {
         if (!toolParser) return;
         for (const ev of toolParser.consumeEvents()) {
           if (ev.type === "text" && ev.content) {
-            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, ev.content)));
-          } else if (ev.type === "tool_call" && ev.call) {
-            // Validate against known tool names
-            const validNames = new Set<string>();
-            if (opts.tools?.length) {
-              for (const t of opts.tools) {
-                const n = t.function?.name;
-                if (n) validNames.add(n);
-              }
+            if (!sawToolCall) {
+              controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, ev.content)));
             }
-            if (validNames.size && !validNames.has(ev.call.name)) {
-              // Unknown tool — emit as text
+          } else if (ev.type === "tool_call" && ev.call) {
+            if (validToolNames.size && !validToolNames.has(ev.call.name)) {
+              if (!sawToolCall) {
+                const fallback = JSON.stringify({ name: ev.call.name, arguments: ev.call.arguments });
+                controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, fallback)));
+              }
               continue;
             }
+            sawToolCall = true;
             const argsStr = typeof ev.call.arguments === "string"
               ? ev.call.arguments
               : JSON.stringify(ev.call.arguments);
-            const tc: ToolCall = {
+            pendingToolCalls.push({
               id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
               type: "function",
               function: { name: ev.call.name, arguments: argsStr },
-            };
-            const chunks = makeToolCallChunk(id, created, currentModel, [tc], null, "tool_calls");
-            for (const chunk of chunks) {
-              controller.enqueue(encoder.encode(chunk));
-            }
+            });
           } else if (ev.type === "tool_call_failed" && ev.content) {
-            // Emit failed tool call content as text
-            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, ev.content)));
+            if (!sawToolCall) {
+              controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, ev.content)));
+            }
           }
         }
       };
@@ -276,19 +279,14 @@ export function createOpenAiStreamFromGrokNdjson(
         if (toolParser) {
           toolParser.finish();
           drainParserEvents();
-        } else if (hasTools && toolBuffer) {
-          // Fallback: no delimiter available, use batch parsing
-          const { text: textContent, toolCalls } = parseToolCalls(toolBuffer, opts.delimiter!, opts.tools);
-          if (toolCalls && toolCalls.length) {
-            const chunks = makeToolCallChunk(id, created, currentModel, toolCalls, textContent, "tool_calls");
+          if (pendingToolCalls.length) {
+            const chunks = makeToolCallChunk(id, created, currentModel, pendingToolCalls, null, "tool_calls");
             for (const chunk of chunks) {
               controller.enqueue(encoder.encode(chunk));
             }
             controller.enqueue(encoder.encode(makeDone()));
             return;
           }
-          // No tool calls found — flush buffered text as normal content
-          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, toolBuffer)));
         }
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
@@ -499,8 +497,6 @@ export function createOpenAiStreamFromGrokNdjson(
               if (toolParser) {
                 toolParser.feed(content);
                 drainParserEvents();
-              } else if (hasTools) {
-                toolBuffer += content;
               } else {
                 controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
               }
