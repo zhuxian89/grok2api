@@ -202,6 +202,8 @@ ${m.TC_END}
 
   if (parallelToolCalls) {
     template += "\n\nYou may make multiple tool calls by using multiple tool call blocks.";
+  } else {
+    template += "\n\nYou MUST make at most one tool call in this response.";
   }
 
   return { prompt: template, delimiter };

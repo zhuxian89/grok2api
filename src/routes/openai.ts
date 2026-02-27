@@ -1313,6 +1313,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             requestedModel,
             tools: body.tools,
             toolChoice: body.tool_choice,
+            parallelToolCalls: body.parallel_tool_calls,
             delimiter,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
@@ -1347,6 +1348,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
           requestedModel,
           tools: body.tools,
           toolChoice: body.tool_choice,
+          parallelToolCalls: body.parallel_tool_calls,
           delimiter,
         });
 

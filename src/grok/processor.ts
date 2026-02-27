@@ -182,6 +182,7 @@ export function createOpenAiStreamFromGrokNdjson(
     requestedModel: string;
     tools?: ToolDefinition[] | undefined;
     toolChoice?: unknown;
+    parallelToolCalls?: boolean | undefined;
     delimiter?: DelimiterMarkers | null | undefined;
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
@@ -232,6 +233,7 @@ export function createOpenAiStreamFromGrokNdjson(
 
       let buffer = "";
       const hasToolDefs = Boolean(opts.tools?.length);
+      const allowParallelToolCalls = opts.parallelToolCalls !== false;
       const toolParser = hasToolDefs && opts.delimiter ? new ToolifyParser(opts.delimiter) : null;
       const validToolNames = new Set<string>();
       if (hasToolDefs) {
@@ -280,7 +282,10 @@ export function createOpenAiStreamFromGrokNdjson(
           toolParser.finish();
           drainParserEvents();
           if (pendingToolCalls.length) {
-            const chunks = makeToolCallChunk(id, created, currentModel, pendingToolCalls, null, "tool_calls");
+            const toolCallsToEmit = allowParallelToolCalls
+              ? pendingToolCalls
+              : pendingToolCalls.slice(0, 1);
+            const chunks = makeToolCallChunk(id, created, currentModel, toolCallsToEmit, null, "tool_calls");
             for (const chunk of chunks) {
               controller.enqueue(encoder.encode(chunk));
             }
@@ -539,6 +544,7 @@ export async function parseOpenAiFromGrokNdjson(
     requestedModel: string;
     tools?: ToolDefinition[] | undefined;
     toolChoice?: unknown;
+    parallelToolCalls?: boolean | undefined;
     delimiter?: DelimiterMarkers | null | undefined;
   },
 ): Promise<Record<string, unknown>> {
@@ -611,7 +617,8 @@ export async function parseOpenAiFromGrokNdjson(
   if (opts.tools?.length && opts.delimiter && content) {
     const { text: textContent, toolCalls } = parseToolCalls(content, opts.delimiter, opts.tools);
     if (toolCalls && toolCalls.length) {
-      const message: Record<string, unknown> = { role: "assistant", tool_calls: toolCalls };
+      const finalToolCalls = opts.parallelToolCalls === false ? toolCalls.slice(0, 1) : toolCalls;
+      const message: Record<string, unknown> = { role: "assistant", tool_calls: finalToolCalls };
       if (textContent) message.content = textContent;
       else message.content = null;
       return {
